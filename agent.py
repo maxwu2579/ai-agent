@@ -1,165 +1,73 @@
-import os
 import json
-import requests
+import os
+from typing import Any, Dict, List
+
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from tools import execute_tool_call, tools
+
 load_dotenv()
+
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
 )
 
-
-def get_weather(city: str) -> str:
-    """查询某个城市的真实天气"""
-    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1"
-    geo = requests.get(geo_url).json()
-    if not geo.get("results"):
-        return f"找不到城市：{city}"
-    lat = geo["results"][0]["latitude"]
-    lon = geo["results"][0]["longitude"]
-    weather_url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        f"&current=temperature_2m,weathercode"
-    )
-    weather = requests.get(weather_url).json()
-    temp = weather["current"]["temperature_2m"]
-    code = weather["current"]["weathercode"]
-    if code == 0:
-        desc = "晴天"
-    elif code in [1, 2, 3]:
-        desc = "多云"
-    elif code in range(51, 68):
-        desc = "下雨"
-    elif code in range(71, 78):
-        desc = "下雪"
-    else:
-        desc = "天气状况未知"
-    return f"{city} 现在 {desc}，温度 {temp}°C"
-
-
-def search_web(query: str) -> str:
-    """搜索网页获取最新信息"""
-    from ddgs import DDGS
-
-    results = list(DDGS().text(query, max_results=3))
-    if not results:
-        return "没有找到相关结果"
-    output = ""
-    for r in results:
-        output += f"标题：{r['title']}\n内容：{r['body']}\n\n"
-    return output
-
-
-def get_exchange_rate(from_currency: str, to_currency: str) -> str:
-    """查询两种货币之间的汇率"""
-    rates = {
-        ("USD", "MYR"): 4.7,
-        ("MYR", "USD"): 0.21,
-        ("USD", "CNY"): 7.2,
-        ("CNY", "USD"): 0.14,
-    }
-    rate = rates.get((from_currency.upper(), to_currency.upper()))
-    if rate:
-        return f"1 {from_currency} = {rate} {to_currency}"
-    return "找不到该汇率"
-
-
-tool_map = {
-    "get_weather": get_weather,
-    "get_exchange_rate": get_exchange_rate,
-    "search_web": search_web,
+SYSTEM_MESSAGE = {
+    "role": "system",
+    "content": "You are a helpful AI assistant. You can check weather, exchange rates, and search the web.",
 }
 
-# DeepSeek 需要用 JSON 格式描述工具
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "查询某个城市的真实天气",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string", "description": "城市名"}},
-                "required": ["city"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_exchange_rate",
-            "description": "查询两种货币之间的汇率",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "from_currency": {"type": "string"},
-                    "to_currency": {"type": "string"},
-                },
-                "required": ["from_currency", "to_currency"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "搜索网页获取最新信息",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"}
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
+MAX_ITERATIONS = 5
 
-messages = [
-    {
-        "role": "system",
-        "content": "你是一个助手，可以查天气、查汇率、搜索网页。需要时调用对应工具。",
-    }
-]
 
-print("Agent 启动！输入 'quit' 退出")
-print("-" * 30)
-
-while True:
-    user_input = input("你：")
-    if user_input.lower() == "quit":
-        break
-
+def run_cli_agent(user_input: str, messages: List[Dict[str, Any]]) -> None:
     messages.append({"role": "user", "content": user_input})
 
-    while True:
+    for _ in range(MAX_ITERATIONS):
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             tools=tools,
         )
         msg = response.choices[0].message
+        msg_dict = msg.model_dump()
 
         if not msg.tool_calls:
-            print(f"Agent：{msg.content}")
+            print(f"Agent: {msg.content}")
             messages.append({"role": "assistant", "content": msg.content})
-            break
+            return
 
-        messages.append(msg)
+        messages.append(msg_dict)
 
-        for tool_call in msg.tool_calls:
-            fn_name = tool_call.function.name
-            fn_args = json.loads(tool_call.function.arguments)
-            print(f"  [调用工具] {fn_name}({fn_args})")
-            result = tool_map[fn_name](**fn_args)
-            print(f"  [工具结果] {result}")
+        for tool_call in msg_dict.get("tool_calls", []):
+            result, event = execute_tool_call(tool_call)
+            print(event.get("message"))
+            print(f"Tool result: {result}")
+
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tool_call.get("id"),
                     "content": result,
                 }
             )
+
+    warning = "Stopped after 5 tool-calling steps to avoid an infinite loop."
+    print(f"Agent: {warning}")
+    messages.append({"role": "assistant", "content": warning})
+
+
+if __name__ == "__main__":
+    conversation = [SYSTEM_MESSAGE.copy()]
+    print("Agent  started. Type 'quit' to exit.")
+    print("-" * 40)
+
+    while True:
+        text = input("You: ").strip()
+        if text.lower() == "quit":
+            break
+        if not text:
+            continue
+        run_cli_agent(text, conversation)
